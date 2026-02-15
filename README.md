@@ -1,2 +1,2 @@
 # Duck-Scraps
-Duck shit I have
+random shit duck coded
