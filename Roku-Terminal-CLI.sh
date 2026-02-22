@@ -195,7 +195,7 @@ while true; do
     
     if [[ "$CMD" == launch* ]]; then
         APP_ID=$(echo "$CMD" | awk '{print $2}')
-        curl -s -d "" "http://$ROKU:$ROKU_PORT/launch/$APP_ID" >/dev/null
+        [[ -z "$APP_ID" ]] && { echo -e "${RED}Usage: launch <app_id>${RESET}"; continue; }
         continue
     fi
 
