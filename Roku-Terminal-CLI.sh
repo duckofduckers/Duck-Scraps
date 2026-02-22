@@ -136,7 +136,7 @@ while true; do
          [ "$CMD" != "power" ] && \
          [ "$CMD" != "help" ] && \
          [ "$CMD" != "clear" ]; then
-         echo -e "${RED}TV is off or unreachable. Only 'power', 'help', and 'clear' commands are working.${RESET}"
+         echo -e "${RED}TV is off or unreachable. Only 'power' if TV is reachable, 'help', and 'clear' commands are working.${RESET}"
          continue
     fi
 
