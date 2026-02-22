@@ -4,10 +4,13 @@ RED="\e[31m"
 RESET="\e[0m"
 
 if ! command -v nmap >/dev/null 2>&1; then
-    { echo -e "${RED}Install nmap package${RESET}"; exit 1; }; }
+    echo -e "\( {RED}Install nmap package \){RESET}"
+    exit 1
 fi
+
 if ! command -v curl >/dev/null 2>&1; then
-    { echo -e "${RED}Install curl package${RESET}"; exit 1; }; }
+    echo -e "\( {RED}Install curl package \){RESET}"
+    exit 1
 fi
 
 clear
