@@ -1,38 +1,71 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+trap 'exit' SIGINT
 
 RED="\e[31m"
 RESET="\e[0m"
 
-if ! command -v nmap >/dev/null 2>&1; then
-    echo -e "\( {RED}Install nmap package \){RESET}"
-    exit 1
-fi
-
-if ! command -v curl >/dev/null 2>&1; then
-    echo -e "\( {RED}Install curl package \){RESET}"
-    exit 1
-fi
+for cmd in nmap curl awk sed grep; do
+    command -v $cmd >/dev/null 2>&1 || { echo -e "${RED}Please install $cmd${RESET}"; exit 1; }
+done
 
 clear
 
 ROKU_PORT=8060
-TIMEOUT=1.55
+TIMEOUT=1.8
+REACHABLE_TIMEOUT_CONNECT=0.25
+REACHABLE_TIMEOUT_TOTAL=0.405
 
 declare -a ROKU_IPS
 declare -a ROKU_NAMES
 
 valid_ip() {
-    [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-    IFS='.' read -r o1 o2 o3 o4 <<< "$1"
-    for o in $o1 $o2 $o3 $o4; do
-        ((o >= 0 && o <= 255)) || return 1
+    local ip=$1
+    [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        (( o >= 0 && o <= 255 )) || return 1
     done
     return 0
 }
 
-get_power_state() {
-    RESPONSE=$(curl -s --max-time $TIMEOUT "http://$ROKU:$ROKU_PORT/query/device-info")
-    echo "$RESPONSE" | sed -n 's:.*<power-mode>\(.*\)</power-mode>.*:\1:p'
+is_tv_reachable() {
+    curl -s --connect-timeout "$REACHABLE_TIMEOUT_CONNECT" --max-time "$REACHABLE_TIMEOUT_TOTAL" \
+         "http://$ROKU:$ROKU_PORT/query/device-info" >/dev/null 2>&1
+}
+
+print_help() {
+    echo
+    echo "Connected to ${ROKU_NAME} (${ROKU})"
+    echo
+    echo "Commands:"
+    echo "  launch <app_id>     → open app (example: launch 12)"
+    echo "  apps                → list installed apps"
+    echo "  active-app          → show current app"
+    echo "  tv-info             → full device information"
+    echo "  power               → toggle power (on/off)"
+    echo "  clear               → clear screen"
+    echo "  help                → this message"
+    echo "  exit()              → quit"
+    echo "  Any other word → sent as keypress (Home, Up, Down, Rev, Play, etc.)"
+    echo
+    echo "Command Syntax:"
+    echo "  cmd\\cmd             → multiple commands"
+    echo "  *delay*\\cmd\\*delay*\\cmd     → command delay"
+    echo
+}
+
+print_is_not_reachable() {
+    echo
+    echo -e "${RED}TV appears to be unreachable.${RESET}"
+    echo "Only 'exit()', 'help' and 'clear' are available right now."
+    echo
+}
+
+print_invalid_selection() {
+    echo
+    echo -e "${RED}Invalid selection.${RESET}"
+    echo
 }
 
 echo "Select connection method:"
@@ -41,167 +74,195 @@ echo "[2] Enter Roku IP manually"
 echo
 
 while true; do
-    read -p "Enter number: " MODE
-    [[ "$MODE" =~ ^[12]$ ]] && break
-    echo -e "${RED}Invalid selection.${RESET}"
+    if ! read -e -r -p "Enter number: " MODE; then
+        exit
+    fi
+    [[ "$MODE" == "1" || "$MODE" == "2" ]] && break
+    print_invalid_selection
 done
 
 echo
 
-if [ "$MODE" = "2" ]; then
+if [[ "$MODE" == "2" ]]; then
     while true; do
-        read -p "Enter Roku IP: " MANUAL_IP
+        if ! read -e -r -p "Enter Roku IP: " MANUAL_IP; then
+            exit
+        fi
         valid_ip "$MANUAL_IP" && break
-        echo -e "${RED}Invalid IP.${RESET}"
+        echo
+        echo -e "${RED}Invalid IP format.${RESET}"
+        echo
     done
 
-    RESPONSE=$(curl -s --max-time $TIMEOUT "http://$MANUAL_IP:$ROKU_PORT/query/device-info")
-    if echo "$RESPONSE" | grep -qi "<friendly-device-name>"; then
-        NAME=$(echo "$RESPONSE" | grep -oP '(?<=<friendly-device-name>).*?(?=</friendly-device-name>)')
+    resp=$(curl -s --max-time "$TIMEOUT" "http://$MANUAL_IP:$ROKU_PORT/query/device-info" 2>/dev/null)
+    if [[ $resp =~ friendly-device-name ]]; then
+        NAME=$(echo "$resp" | sed -n 's/.*<friendly-device-name>\(.*\)<\/friendly-device-name>.*/\1/p' | tr -d '\r')
+        [[ -z "$NAME" ]] && NAME="Unnamed Roku"
         ROKU_IPS+=("$MANUAL_IP")
         ROKU_NAMES+=("$NAME")
+        INDEX=0
     else
-        echo -e "${RED}Device did not respond as Roku.${RESET}"
+        echo
+        echo -e "${RED}No valid Roku response from that IP.${RESET}"
+        echo
         exit 1
     fi
 else
     LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-    if [ -z "$LOCAL_IP" ]; then
-        LOCAL_IP=$(ifconfig 2>/dev/null | awk '/inet / && !/127.0.0.1/ {print $2; exit}')
-    fi
+    [[ -z "$LOCAL_IP" ]] && LOCAL_IP=$(ip -4 addr show scope global 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
+    [[ -z "$LOCAL_IP" ]] && LOCAL_IP=$(ifconfig 2>/dev/null | awk '/inet / && !/127.0.0.1/ {print $2; exit}')
 
-    valid_ip "$LOCAL_IP" || { echo -e "${RED}Could not determine valid local IP${RESET}"; exit 1; }
+    valid_ip "$LOCAL_IP" || { echo -e "${RED}Could not determine local network IP${RESET}"; exit 1; }
 
     PREFIX=$(echo "$LOCAL_IP" | awk -F. '{print $1"."$2"."$3"."}')
+
     echo "Local IP: $LOCAL_IP"
-    echo "Scanning subnet ${PREFIX}0/24..."
+    echo "Scanning subnet ${PREFIX}0/24 (may take 5-15 seconds)..."
     echo
 
-    ACTIVE_IPS=$(nmap -sn "${PREFIX}0/24" | awk '/Nmap scan report/{print $NF}')
+    ACTIVE_IPS=$(nmap -sn -T4 "${PREFIX}0/24" 2>/dev/null | awk '/Nmap scan report for/{print $NF}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+    [[ -z "$ACTIVE_IPS" ]] && { echo -e "${RED}No active hosts found.${RESET}"; exit 1; }
 
     for IP in $ACTIVE_IPS; do
-        valid_ip "$IP" || continue
-        RESPONSE=$(curl -s --max-time $TIMEOUT "http://$IP:$ROKU_PORT/query/device-info")
-        if echo "$RESPONSE" | grep -qi "<friendly-device-name>"; then
-            NAME=$(echo "$RESPONSE" | grep -oP '(?<=<friendly-device-name>).*?(?=</friendly-device-name>)')
+        resp=$(curl -s --max-time "$TIMEOUT" "http://$IP:$ROKU_PORT/query/device-info" 2>/dev/null)
+        if [[ $resp =~ friendly-device-name ]]; then
+            NAME=$(echo "$resp" | sed -n 's/.*<friendly-device-name>\(.*\)<\/friendly-device-name>.*/\1/p' | tr -d '\r')
+            [[ -z "$NAME" ]] && NAME="Roku-$IP"
             ROKU_IPS+=("$IP")
             ROKU_NAMES+=("$NAME")
-            echo "Found Roku: $NAME ($IP)"
+            echo "Found: $NAME ($IP)"
         fi
+        sleep 0.05
     done
 
-    echo
-    [ ${#ROKU_IPS[@]} -eq 0 ] && { echo -e "${RED}No Roku devices found.${RESET}"; exit 1; }
+    [[ ${#ROKU_IPS[@]} -eq 0 ]] && { echo -e "${RED}No Roku devices found.${RESET}"; exit 1; }
 
+    echo
     echo "Select a Roku device:"
     for i in "${!ROKU_IPS[@]}"; do
-        echo "[$((i+1))] ${ROKU_NAMES[$i]} (${ROKU_IPS[$i]})"
+        echo "[$((i+1))] ${ROKU_NAMES[i]} (${ROKU_IPS[i]})"
     done
 
     while true; do
-        read -p "Enter number: " selection
-        [[ "$selection" =~ ^[0-9]+$ ]] || { echo -e "${RED}Invalid selection.${RESET}"; continue; }
+        if ! read -e -r -p "Enter number: " selection; then
+            exit
+        fi
+        [[ "$selection" =~ ^[0-9]+$ ]] || { print_invalid_selection; continue; }
         INDEX=$((selection-1))
-        [ "$INDEX" -ge 0 ] && [ "$INDEX" -lt "${#ROKU_IPS[@]}" ] && break
-        echo -e "${RED}Invalid selection.${RESET}"
+        (( INDEX >= 0 && INDEX < ${#ROKU_IPS[@]} )) && break
+        print_invalid_selection
     done
 fi
 
-[ "$MODE" = "2" ] && INDEX=0
+ROKU="${ROKU_IPS[INDEX]}"
+ROKU_NAME="${ROKU_NAMES[INDEX]}"
 
-ROKU="${ROKU_IPS[$INDEX]}"
+print_help
 
-echo
-echo "Connected to ${ROKU_NAMES[$INDEX]} ($ROKU)"
-echo "Type 'exit()' to quit."
-echo "Use: launch <app_id> to open an app."
-echo "Use: apps to list installed apps."
-echo "Use: tv-info to show full device info."
-echo "Use: active-app to show currently running app."
-echo "Use: clear to clear the terminal"
-echo "Use: help to get help on how to use the CLI again."
-echo
+process_command() {
+    local CMD="$1"
+    [[ "$CMD" == "exit()" ]] && exit
+    [[ "$CMD" == "clear" ]] && { clear; return; }
+    [[ "$CMD" == "help" ]] && { print_help; return; }
+
+    if ! is_tv_reachable; then
+        print_is_not_reachable
+        return
+    fi
+
+    case "$CMD" in
+        apps)
+            echo
+            curl -s --max-time 0.405 "http://$ROKU:$ROKU_PORT/query/apps" | \
+            grep -o '<app .*</app>' | \
+            while IFS= read -r line; do
+                id=$(echo "$line" | sed -n 's/.*id="\([^"]*\)".*/\1/p')
+                name=$(echo "$line" | sed -n 's/.*>\(.*\)<\/app>/\1/p')
+                [[ -n "$name" ]] && echo "$id → $name"
+            done | nl -w2 -s': '
+            echo
+            ;;
+        tv-info)
+            echo
+            curl -s --max-time 0.405 "http://$ROKU:$ROKU_PORT/query/device-info" | \
+            sed -n 's/<\([^>]*\)>\(.*\)<\/\1>/\1: \2/p' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+            echo
+            ;;
+        active-app)
+            echo
+            resp=$(curl -s --max-time 0.5 "http://$ROKU:$ROKU_PORT/query/active-app")
+            id=$(echo "$resp" | sed -n 's/.*id="\([^"]*\)".*/\1/p')
+            name=$(echo "$resp" | sed -n 's/.*>\(.*\)<\/app>.*/\1/p')
+            [[ -n "$name" ]] && echo "Active: $id → $name" || echo "No active app detected"
+            echo
+            ;;
+        launch*)
+            echo
+            APP_ID=$(echo "$CMD" | awk '{print $2}')
+            if [[ -z "$APP_ID" ]]; then
+                echo -e "${RED}Usage: launch <app_id>${RESET}"
+                return
+            fi
+            curl -s --max-time 0.6 -o /dev/null -X POST "http://$ROKU:$ROKU_PORT/launch/$APP_ID"
+            echo "Launch request sent for app $APP_ID"
+            echo
+            ;;
+        power)
+            curl -s --max-time 0.55 -o /dev/null -X POST "http://$ROKU:$ROKU_PORT/keypress/Power"
+            echo
+            echo "Power key sent"
+            echo
+            ;;
+        *)
+            curl -s --max-time 0.405 -o /dev/null -X POST "http://$ROKU:$ROKU_PORT/keypress/$CMD"
+            ;;
+    esac
+}
 
 while true; do
-    read -p "[${ROKU_NAMES[$INDEX]}] CMD ~: " CMD
-    CMD=$(echo "$CMD" | tr '[:upper:]' '[:lower:]' | xargs)
-
-    [ -z "$CMD" ] && continue
-
-    if [ "$CMD" = "exit()" ]; then
-        echo "Exiting..."
-        break
+    if ! read -e -r -p "[${ROKU_NAME}] ECP ~: " input; then
+        exit
     fi
+    CMD="${input,,}"
+    CMD="${CMD#"${CMD%%[![:space:]]*}"}"
+    CMD="${CMD%"${CMD##*[![:space:]]}"}" 
+    [[ -z "$CMD" ]] && continue
 
-    POWER_STATE=$(get_power_state)
-
-    if { [ -z "$POWER_STATE" ] || [ "$POWER_STATE" != "PowerOn" ]; } && \
-         [ "$CMD" != "power" ] && \
-         [ "$CMD" != "help" ] && \
-         [ "$CMD" != "clear" ]; then
-         echo -e "${RED}TV is off or unreachable. Only 'power' if TV is reachable, 'help', and 'clear' commands are working.${RESET}"
-         continue
-    fi
-
-    if [ "$CMD" = "apps" ]; then
-        echo
-        i=1
-        curl -s "http://$ROKU:$ROKU_PORT/query/apps" | \
-        grep "<app " | \
-        while read line; do
-            APP_ID=$(echo "$line" | sed -n 's/.*id="\([^"]*\)".*/\1/p')
-            APP_NAME=$(echo "$line" | sed -n 's/.*>\(.*\)<\/app>.*/\1/p')
-            echo "$i: $APP_ID ~> $APP_NAME"
-            ((i++))
-        done
-        echo
+    if [[ "$CMD" != *"\\"* ]]; then
+        process_command "$CMD"
         continue
     fi
 
-    if [ "$CMD" = "tv-info" ]; then
-        echo
-        RESPONSE=$(curl -s "http://$ROKU:$ROKU_PORT/query/device-info")
-        echo "Device Info:"
-        echo "$RESPONSE" | sed -n 's/.*<\([^>]*\)>\(.*\)<\/[^>]*>/\1: \2/p'
-        echo
-        continue
-    fi
-
-    if [ "$CMD" = "active-app" ]; then
-        RESPONSE=$(curl -s "http://$ROKU:$ROKU_PORT/query/active-app")
-        APP_ID=$(echo "$RESPONSE" | sed -n 's/.*<app id="\([^"]*\)".*/\1/p')
-        APP_NAME=$(echo "$RESPONSE" | sed -n 's/.*<app id="[^"]*".*>\(.*\)<\/app>.*/\1/p')
-        echo
-        echo "Active App: $APP_ID ~> $APP_NAME"
-        echo
-        continue
-    fi
+    IFS='\\' read -ra PARTS <<< "$CMD"
     
-    if [ "$CMD" = "clear" ]; then
-        clear
-        continue
-    fi
-
-    if [ "$CMD" = "help" ]; then
+    empty=false
+    for part in "${PARTS[@]}"; do
+        [[ -z "${part//[[:space:]]/}" ]] && empty=true && break
+    done
+    if $empty || [[ ${#PARTS[@]} -lt 2 ]]; then
         echo
-        echo "Connected to ${ROKU_NAMES[$INDEX]} ($ROKU)"
-        echo "Type 'exit()' to quit."
-        echo "Use: launch <app_id> to open an app."
-        echo "Use: apps to list installed apps."
-        echo "Use: tv-info to show full device info."
-        echo "Use: active-app to show currently running app."
-        echo "Use: clear to clear the terminal"
-        echo "Use: help to get help on how to use the CLI again."
+        echo -e "${RED}Syntax error: invalid multi command usage${RESET}"
         echo
         continue
     fi
-    
-    if [[ "$CMD" == launch* ]]; then
-        APP_ID=$(echo "$CMD" | awk '{print $2}')
-        [[ -z "$APP_ID" ]] && { echo -e "${RED}Usage: launch <app_id>${RESET}"; continue; }
-        curl -s -d "" "http://$ROKU:$ROKU_PORT/launch/$APP_ID" >/dev/null
-        continue
-    fi
 
-    curl -s -d "" "http://$ROKU:$ROKU_PORT/keypress/$CMD" >/dev/null
+    last_was_command=false
+    for i in "${!PARTS[@]}"; do
+    part="${PARTS[i]}"
+    p="${part#"${part%%[![:space:]]*}"}"
+    p="${p%"${p##*[![:space:]]}"}"  
+    if [[ "$p" =~ ^\*([0-9]+(\.[0-9]+)?)\*$ ]]; then
+        if [[ ! $last_was_command && $i -ne 0 ]]; then
+            echo
+            echo -e "${RED}Syntax error: invalid delay usage${RESET}"
+            echo
+            break
+        fi
+        sleep "${BASH_REMATCH[1]}"
+        last_was_command=false
+    else
+        process_command "$p"
+        last_was_command=true
+    fi
+    done
 done
