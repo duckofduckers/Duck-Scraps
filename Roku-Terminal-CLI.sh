@@ -159,7 +159,7 @@ print_help
 
 process_command() {
     local CMD="$1"
-    [[ "$CMD" == "exit()" ]] && exit
+    [[ "$CMD" == "exit()" ]] && { exit; }
     [[ "$CMD" == "clear" ]] && { clear; return; }
     [[ "$CMD" == "help" ]] && { print_help; return; }
 
