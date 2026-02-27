@@ -3,7 +3,7 @@
 RED="\e[31m"
 RESET="\e[0m"
 
-for cmd in nmap curl awk sed grep; do
+for cmd in nmap curl gawk sed grep ifconfig; do
     command -v $cmd >/dev/null 2>&1 || { echo -e "${RED}Please install $cmd${RESET}"; exit 1; }
 done
 
@@ -11,8 +11,15 @@ clear
 
 ROKU_PORT=8060
 TIMEOUT=1.8
-REACHABLE_TIMEOUT_CONNECT=0.255
-REACHABLE_TIMEOUT_TOTAL=0.415
+
+if ping -c 3 -W 1 "$ROKU" >/dev/null 2>&1; then
+    AVG_PING=$(ping -c 3 -q "$ROKU" | awk -F'/' '/rtt/ {print $5}')
+    REACHABLE_TIMEOUT_CONNECT=$(awk "BEGIN {print $AVG_PING/1000 * 2}")
+    REACHABLE_TIMEOUT_TOTAL=$(awk "BEGIN {print $AVG_PING/1000 * 4}")
+else
+    REACHABLE_TIMEOUT_CONNECT=0.255
+    REACHABLE_TIMEOUT_TOTAL=0.415
+fi
 
 declare -a ROKU_IPS
 declare -a ROKU_NAMES
@@ -106,34 +113,52 @@ if [[ "$MODE" == "2" ]]; then
         exit 1
     fi
 else
-    LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-    [[ -z "$LOCAL_IP" ]] && LOCAL_IP=$(ip -4 addr show scope global 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
-    [[ -z "$LOCAL_IP" ]] && LOCAL_IP=$(ifconfig 2>/dev/null | awk '/inet / && !/127.0.0.1/ {print $2; exit}')
+    read IP MASK <<< $(ifconfig 2>/dev/null \
+    | awk '/inet / && !/127.0.0.1/ && !/tun/ && !/rmnet/ {print $2, $4; exit}')
 
-    valid_ip "$LOCAL_IP" || { echo -e "${RED}Could not determine local network IP${RESET}"; exit 1; }
+    mask2cidr () {
+        local x n=0
+        IFS=. read -r i1 i2 i3 i4 <<< "$1"
+        for x in $i1 $i2 $i3 $i4; do
+            while [ $x -gt 0 ]; do
+                ((n+=x&1))
+                ((x>>=1))
+            done
+        done
+        echo $n
+    }
 
-    PREFIX=$(echo "$LOCAL_IP" | awk -F. '{print $1"."$2"."$3"."}')
+    CIDR=$(mask2cidr "$MASK")
 
-    echo "Local IP: $LOCAL_IP"
-    echo "Scanning subnet ${PREFIX}0/24 (may take 5-15 seconds)..."
+    IFS=. read -r i1 i2 i3 i4 <<< "$IP"
+    IFS=. read -r m1 m2 m3 m4 <<< "$MASK"
+
+    NETWORK="$((i1&m1)).$((i2&m2)).$((i3&m3)).$((i4&m4))"
+
+    valid_ip "$IP" || { echo -e "${RED}Could not determine local network IP${RESET}"; echo; exit 1; }
+
+    echo "Local IP: $IP"
+    echo "Scanning subnet ${NETWORK}/${CIDR} (may take 5-15 seconds)..."
     echo
 
-    ACTIVE_IPS=$(nmap -sn -T4 "${PREFIX}0/24" 2>/dev/null | awk '/Nmap scan report for/{print $NF}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+    ACTIVE_IPS=$(nmap -sn -T4 "${NETWORK}/${CIDR}" 2>/dev/null | \
+    awk '/Nmap scan report for/{print $NF}' | \
+    grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
     [[ -z "$ACTIVE_IPS" ]] && { echo -e "${RED}No active hosts found.${RESET}"; exit 1; }
 
-    for IP in $ACTIVE_IPS; do
-        resp=$(curl -s --max-time "$TIMEOUT" "http://$IP:$ROKU_PORT/query/device-info" 2>/dev/null)
+    for HOST in $ACTIVE_IPS; do
+        resp=$(curl -s --max-time "$TIMEOUT" "http://$HOST:$ROKU_PORT/query/device-info" 2>/dev/null)
         if [[ $resp =~ friendly-device-name ]]; then
             NAME=$(echo "$resp" | sed -n 's/.*<friendly-device-name>\(.*\)<\/friendly-device-name>.*/\1/p' | tr -d '\r')
-            [[ -z "$NAME" ]] && NAME="Roku-$IP"
-            ROKU_IPS+=("$IP")
+            [[ -z "$NAME" ]] && NAME="Roku-$HOST"
+            ROKU_IPS+=("$HOST")
             ROKU_NAMES+=("$NAME")
-            echo "Found: $NAME ($IP)"
+            echo "Found: $NAME ($HOST)"
         fi
         sleep 0.05
     done
 
-    [[ ${#ROKU_IPS[@]} -eq 0 ]] && { echo -e "${RED}No Roku devices found.${RESET}"; exit 1; }
+    [[ ${#ROKU_IPS[@]} -eq 0 ]] && { echo -e "${RED}No Roku devices found.${RESET}"; echo; exit 1; }
 
     echo
     echo "Select a Roku device:"
@@ -159,7 +184,7 @@ print_help
 
 process_command() {
     local CMD="$1"
-    [[ "$CMD" == "exit()" ]] && { exit; }
+    [[ "$CMD" == "exit()" ]] && { echo; exit; }
     [[ "$CMD" == "clear" ]] && { clear; return; }
     [[ "$CMD" == "help" ]] && { print_help; return; }
 
@@ -171,7 +196,7 @@ process_command() {
     case "$CMD" in
         apps)
             echo
-            curl -s --max-time 0.405 "http://$ROKU:$ROKU_PORT/query/apps" | \
+            curl -s --max-time 0.56 "http://$ROKU:$ROKU_PORT/query/apps" | \
             grep -o '<app .*</app>' | \
             while IFS= read -r line; do
                 id=$(echo "$line" | sed -n 's/.*id="\([^"]*\)".*/\1/p')
@@ -182,7 +207,7 @@ process_command() {
             ;;
         tv-info)
             echo
-            curl -s --max-time 0.405 "http://$ROKU:$ROKU_PORT/query/device-info" | \
+            curl -s --max-time 0.55 "http://$ROKU:$ROKU_PORT/query/device-info" | \
             sed -n 's/<\([^>]*\)>\(.*\)<\/\1>/\1: \2/p' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
             echo
             ;;
@@ -206,13 +231,13 @@ process_command() {
             echo
             ;;
         power)
-            curl -s --max-time 0.55 -o /dev/null -X POST "http://$ROKU:$ROKU_PORT/keypress/Power"
+            curl -s --max-time 0.6 -o /dev/null -X POST "http://$ROKU:$ROKU_PORT/keypress/Power"
             echo
             echo "Power key sent"
             echo
             ;;
         *)
-            curl -s --max-time 0.405 -o /dev/null -X POST "http://$ROKU:$ROKU_PORT/keypress/$CMD"
+            curl -s --max-time 0.6 -o /dev/null -X POST "http://$ROKU:$ROKU_PORT/keypress/$CMD"
             ;;
     esac
 }
@@ -246,21 +271,21 @@ while true; do
 
     last_was_command=false
     for i in "${!PARTS[@]}"; do
-    part="${PARTS[i]}"
-    p="${part#"${part%%[![:space:]]*}"}"
-    p="${p%"${p##*[![:space:]]}"}"  
-    if [[ "$p" =~ ^\*([0-9]+(\.[0-9]+)?)\*$ ]]; then
-        if [[ ! $last_was_command && $i -ne 0 ]]; then
-            echo
-            echo -e "${RED}Syntax error: invalid delay usage${RESET}"
-            echo
-            break
+        part="${PARTS[i]}"
+        p="${part#"${part%%[![:space:]]*}"}"
+        p="${p%"${p##*[![:space:]]}"}"  
+        if [[ "$p" =~ ^\*([0-9]+(\.[0-9]+)?)\*$ ]]; then
+            if [[ ! $last_was_command && $i -ne 0 ]]; then
+                echo
+                echo -e "${RED}Syntax error: invalid delay usage${RESET}"
+                echo
+                break
+            fi
+            sleep "${BASH_REMATCH[1]}"
+            last_was_command=false
+        else
+            process_command "$p"
+            last_was_command=true
         fi
-        sleep "${BASH_REMATCH[1]}"
-        last_was_command=false
-    else
-        process_command "$p"
-        last_was_command=true
-    fi
     done
 done
