@@ -243,7 +243,7 @@ process_command() {
 }
 
 while true; do
-    if ! read -e -r -p "[${ROKU_NAME}] ECP ~: " input; then
+    if ! read -e -r -p "[${ROKU_NAME}] ECP </> " input; then
         exit
     fi
     CMD="${input,,}"
